@@ -1,0 +1,140 @@
+init: &init
+  working_directory: /home/circleci/d8
+  environment:
+    TZ: "/usr/share/zoneinfo/America/Los_Angeles"
+    DEBUG: "true"
+  docker:
+    - image: circleci/php:7.1
+
+version: 2
+jobs:
+  build:
+    <<: *init
+    steps:
+      - checkout
+      - restore_cache:
+          key: composer-cache
+      - run:
+          name: Set github token to avoid rate limit
+          command: |
+            composer config --global github-oauth.github.com $GIT_TOKEN
+            git config --global user.email $GIT_EMAIL
+            git config --global user.name $CIRCLE_USERNAME
+      - run: echo 'StrictHostKeyChecking no' > ~/.ssh/config
+      - run: echo 'export PATH=$HOME/terminus/bin:$PATH' >> $BASH_ENV
+      - run:
+          name: Install Terminus
+          command: sh scripts/install_terminus.sh
+      - run:
+          name: Increase memory
+          command: |
+            sudo touch $PHP_INI_DIR/php.ini
+            echo "memory_limit = 512M" | sudo tee -a $PHP_INI_DIR/php.ini
+      - run:
+          name: Run composer for project and pattern-lab
+          command: sh scripts/build.sh
+      - save_cache:
+          key: composer-cache
+          paths:
+            - ~/.composer/cache
+      - save_cache:
+          key: cache-{{ .Environment.CIRCLE_SHA1 }}
+          paths:
+            - ~/.terminus/tokens
+            - ~/terminus
+            - ~/.ssh
+            - ~/.gitconfig
+
+  code-sniffers:
+    <<: *init
+    steps:
+      - checkout
+      - restore_cache:
+          key: coder-cache
+      - run: echo 'export PATH=$HOME/coder/vendor/bin:$PATH' >> $BASH_ENV
+      - run:
+          name: Install Coder Sniffer
+          command: ./scripts/install_coder_sniffer.sh
+      - save_cache:
+          key: coder-cache
+          paths:
+            - ~/coder
+      - run:
+          name: Run Sniffer
+          command: ./scripts/phpcs.sh
+
+  multidev: &multidev
+    <<: *init
+    steps:
+      - restore_cache:
+          key: cache-{{ .Environment.CIRCLE_SHA1 }}
+      - run: echo 'export PATH=$HOME/terminus/bin:$PATH' >> $BASH_ENV
+      - run:
+          name: Deploy to multidev
+          command: ./scripts/multidev.sh
+
+  deploy-heroku:
+    <<: *init
+    steps:
+      - restore_cache:
+          key: cache-{{ .Environment.CIRCLE_SHA1 }}
+      - run:
+          name: Install heroku
+          command: |
+            sudo apt-get update
+            sudo apt-get -y install software-properties-common
+            sudo add-apt-repository "deb https://cli-assets.heroku.com/branches/stable/apt ./"
+            curl -L https://cli-assets.heroku.com/apt/release.key | sudo apt-key add -
+            sudo apt-get install apt-transport-https
+            sudo apt-get update
+            sudo apt-get install heroku
+      - run:
+          name: Login to heroku
+          command: |
+            cat > ~/.netrc << EOF
+            machine api.heroku.com
+              login $HEROKU_EMAIL
+              password $HEROKU_TOKEN
+            machine git.heroku.com
+              login $HEROKU_EMAIL
+              password $HEROKU_TOKEN
+            EOF
+      - run:
+          command: chmod 600 ~/.netrc
+      - run:
+          command: "[[ ! -s \"$(git rev-parse --git-dir)/shallow\" ]] || git fetch --unshallow"
+      - run:
+          command: ./scripts/deploy_to_heroku.sh
+
+  deploy-pantheon:
+    <<: *init
+    steps:
+      - restore_cache:
+          key: cache-{{ .Environment.CIRCLE_SHA1 }}
+      - run:
+          command: bash scripts/deploy_to_pantheon.sh
+
+workflows:
+  version: 2
+  multi-build-flow:
+    jobs:
+      - code-sniffers
+      - build:
+          requires:
+            - code-sniffers
+
+      - deploy-pantheon:
+          requires:
+            - build
+          filters:
+            branches:
+              only:
+                - master
+
+      - deploy-heroku:
+          requires:
+            - build
+          filters:
+            branches:
+              only:
+                - master
